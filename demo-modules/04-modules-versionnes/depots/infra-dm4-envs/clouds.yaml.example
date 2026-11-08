@@ -1,0 +1,35 @@
+# Une entrée par environnement. Généré par socle/ (un projet et un compte
+# par environnement). Sans socle, sur un lab mono-projet : copier ce
+# fichier en clouds.yaml et mettre les identifiants admin dans les trois
+# entrées (l'isolation ne repose alors plus que sur les états et les noms).
+clouds:
+  dm4-dev:
+    auth:
+      auth_url: http://192.168.56.250:5000
+      username: ci-dm4-dev
+      password: "<mot de passe>"
+      project_name: dm4-dev
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
+    identity_api_version: 3
+  dm4-staging:
+    auth:
+      auth_url: http://192.168.56.250:5000
+      username: ci-dm4-staging
+      password: "<mot de passe>"
+      project_name: dm4-staging
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
+    identity_api_version: 3
+  dm4-prod:
+    auth:
+      auth_url: http://192.168.56.250:5000
+      username: ci-dm4-prod
+      password: "<mot de passe>"
+      project_name: dm4-prod
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
+    identity_api_version: 3

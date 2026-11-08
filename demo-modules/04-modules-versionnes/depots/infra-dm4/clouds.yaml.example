@@ -1,0 +1,15 @@
+# Copier en clouds.yaml (ignoré par git) et renseigner le mot de passe.
+# En CI : contenu de ce fichier dans une variable GitLab de type FICHIER
+# nommée OS_CLIENT_CONFIG_FILE.
+clouds:
+  kolla-aio:
+    auth:
+      auth_url: http://192.168.56.250:5000
+      username: admin
+      password: "<mot de passe>"
+      project_name: admin
+      user_domain_name: Default
+      project_domain_name: Default
+    region_name: RegionOne
+    interface: public
+    identity_api_version: 3

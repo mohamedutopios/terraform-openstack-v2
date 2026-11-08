@@ -1,0 +1,28 @@
+# Un include commun (conformité, sécurité, matrice des versions), puis le
+# MÊME template inclus une fois par environnement, paramétré par inputs :
+# il crée validate-dev, plan-dev, apply-dev... validate-prod, apply-prod.
+include:
+  - project: mohamed.aijjou1780/terraform-ci-templates
+    ref: v1.2.0
+    file: templates/environnements.yml
+  - project: mohamed.aijjou1780/terraform-ci-templates
+    ref: v1.2.0
+    file: templates/environnement.yml
+    inputs:
+      env: dev
+      tier: development
+  - project: mohamed.aijjou1780/terraform-ci-templates
+    ref: v1.2.0
+    file: templates/environnement.yml
+    inputs:
+      env: staging
+      tier: staging
+  - project: mohamed.aijjou1780/terraform-ci-templates
+    ref: v1.2.0
+    file: templates/environnement.yml
+    inputs:
+      env: prod
+      tier: production
+      # Identifiants de prod = variable PROTÉGÉE : absente des MR. Le plan de
+      # prod tourne sur la branche par défaut, relu avant l'apply manuel.
+      plan_en_mr: false

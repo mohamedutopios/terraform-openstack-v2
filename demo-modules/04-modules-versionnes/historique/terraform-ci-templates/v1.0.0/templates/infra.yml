@@ -1,0 +1,284 @@
+# =============================================================================
+# Pipeline d'une INFRA qui consomme des modules versionnés (dépôt infra-*)
+#
+#   include:
+#     - project: mohamed.aijjou1780/terraform-ci-templates
+#       ref: v1.0.0
+#       file: templates/infra.yml
+#
+#   conformite : modules épinglés sur un tag SemVer, aucun secret commité
+#   qualite    : fmt, validate (télécharge les modules), tflint
+#   securite   : checkov (code + modules), KICS
+#   plan       : plan + checkov sur le plan       -> runner tag "openstack"
+#   deploiement: apply / destroy MANUELS, branche par défaut uniquement
+#
+# Prérequis GitLab (voir README de la démo) :
+#   - chaque dépôt de module autorise ce projet dans
+#     Settings > CI/CD > Job token permissions (allowlist)
+#   - variable CI/CD de type FICHIER  OS_CLIENT_CONFIG_FILE  = clouds.yaml
+#     (non protégée pour que le plan tourne aussi sur les MR)
+#   - variable CI/CD de type FICHIER  TF_VAR_public_key_path = clé publique SSH
+#     (non protégée : tflint et plan en ont besoin, ce n'est pas un secret)
+#   - un runner tagué "openstack" qui joint l'API OpenStack
+# =============================================================================
+
+variables:
+  TF_VERSION: "1.16.7"
+  TFLINT_IMAGE: ghcr.io/terraform-linters/tflint:v0.64.0
+  CHECKOV_IMAGE: bridgecrew/checkov:3.4.2
+  KICS_IMAGE: checkmarx/kics:v2.1.21
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.29.1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_PLUGIN_CACHE_DIR: ${CI_PROJECT_DIR}/.tf-plugin-cache
+  # Etat Terraform stocké par GitLab (Operate > Terraform states)
+  TF_STATE_NAME: default
+  TF_HTTP_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/${TF_STATE_NAME}
+  TF_HTTP_LOCK_ADDRESS: ${TF_HTTP_ADDRESS}/lock
+  TF_HTTP_UNLOCK_ADDRESS: ${TF_HTTP_ADDRESS}/lock
+  TF_HTTP_LOCK_METHOD: POST
+  TF_HTTP_UNLOCK_METHOD: DELETE
+  TF_HTTP_USERNAME: gitlab-ci-token
+  TF_HTTP_PASSWORD: ${CI_JOB_TOKEN}
+  TF_HTTP_RETRY_WAIT_MIN: "5"
+
+stages:
+  - conformite
+  - qualite
+  - securite
+  - plan
+  - deploiement
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+# Les modules sont dans des dépôts PRIVÉS. Le code garde des URL propres
+# (https://gitlab.com/...) ; c'est git qui injecte le jeton du job.
+.git-auth: &git-auth
+  - git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/".insteadOf "https://${CI_SERVER_HOST}/"
+
+.terraform:
+  image:
+    name: hashicorp/terraform:${TF_VERSION}
+    entrypoint: [""]
+  before_script:
+    - *git-auth
+    - mkdir -p "${TF_PLUGIN_CACHE_DIR}"
+  cache:
+    key: tf-providers-${TF_VERSION}
+    paths:
+      - .tf-plugin-cache/
+
+# Etat local en poste de travail, état GitLab en CI : le backend n'est
+# ajouté qu'ici (configuration partielle, valeurs dans TF_HTTP_*).
+.backend-gitlab: &backend-gitlab
+  - printf 'terraform {\n  backend "http" {}\n}\n' > backend_ci.tf
+
+# -------------------------------------------------------------- conformite ---
+
+# Règle d'équipe : l'infra ne consomme QUE des modules versionnés.
+#   ./modules/x            -> refusé (code non versionné à part)
+#   git::...               -> exige ?ref=vX.Y.Z
+#   registre (a/b/c)       -> exige version = "X.Y.Z" ou "~> X.Y"
+verifier-refs-modules:
+  stage: conformite
+  image: alpine:3.22
+  script:
+    - |
+      # Liste "fichier|source" de chaque bloc module (pas les source des providers)
+      find . -name '*.tf' -not -path './.terraform/*' -exec awk '
+        /^[[:space:]]*module[[:space:]]+"/ { dans_module = 1 }
+        dans_module && /^[[:space:]]*source[[:space:]]*=/ {
+          match($0, /"[^"]+"/); print FILENAME "|" substr($0, RSTART + 1, RLENGTH - 2)
+          dans_module = 0
+        }' {} + > sources.txt
+      ko=0
+      while IFS='|' read -r f src; do
+        case "$src" in
+          ./*|../*) echo "KO  $f : module local non versionné : $src"; ko=1 ;;
+          git::*)
+            if echo "$src" | grep -Eq '[?&]ref=v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "OK  $f : $src"
+            else
+              echo "KO  $f : module git non épinglé sur un tag SemVer : $src"; ko=1
+            fi ;;
+          *) echo "OK? $f : module de registre, vérifier son argument version : $src" ;;
+        esac
+      done < sources.txt
+      [ -s sources.txt ] || echo "Aucun module appelé."
+      [ "$ko" = 0 ] || { echo "=> références de modules non conformes"; exit 1; }
+
+# Un clouds.yaml avec mot de passe commité par erreur ? Le pipeline s'arrête.
+gitleaks:
+  stage: conformite
+  image:
+    name: ${GITLEAKS_IMAGE}
+    entrypoint: [""]
+  script:
+    - gitleaks dir . --redact --verbose --report-format junit --report-path gitleaks.xml
+  artifacts:
+    when: always
+    reports:
+      junit: gitleaks.xml
+
+# ----------------------------------------------------------------- qualite ---
+
+fmt:
+  extends: .terraform
+  stage: qualite
+  needs: []
+  script:
+    - terraform fmt -check -recursive -diff
+
+# init télécharge les modules aux tags demandés (.terraform/modules).
+# -lockfile=readonly : les versions de providers sont celles du
+# .terraform.lock.hcl commité, jamais une montée silencieuse.
+validate:
+  extends: .terraform
+  stage: qualite
+  needs: []
+  script:
+    - terraform init -backend=false -lockfile=readonly
+    - terraform validate
+    - cat .terraform/modules/modules.json
+  artifacts:
+    paths:
+      - .terraform/modules/
+    expire_in: 1 hour
+
+# --call-module-type=all : tflint évalue aussi les appels de modules
+# (valeurs passées, variables manquantes...), modules fournis par validate.
+tflint:
+  stage: qualite
+  needs: [validate]
+  image:
+    name: ${TFLINT_IMAGE}
+    entrypoint: [""]
+  script:
+    - tflint --call-module-type=all -f junit > tflint.xml || true
+    - tflint --call-module-type=all -f compact
+  artifacts:
+    when: always
+    reports:
+      junit: tflint.xml
+
+# ---------------------------------------------------------------- securite ---
+
+# Checkov télécharge lui-même les modules externes pour les analyser.
+# CKV_TF_1 (hash de commit) est volontairement écarté dans .checkov.yaml :
+# on accepte des tags SemVer, rendus immuables par les tags protégés.
+checkov:
+  stage: securite
+  needs: []
+  image:
+    name: ${CHECKOV_IMAGE}
+    entrypoint: [""]
+  before_script:
+    - *git-auth
+  script:
+    - checkov -d . --config-file .checkov.yaml -o cli -o junitxml --output-file-path console,checkov.xml
+  artifacts:
+    when: always
+    reports:
+      junit: checkov.xml
+
+kics:
+  stage: securite
+  needs: []
+  image:
+    name: ${KICS_IMAGE}
+    entrypoint: [""]
+  script:
+    - /app/bin/kics scan -p "${CI_PROJECT_DIR}" --ci --no-progress
+      --exclude-paths "${CI_PROJECT_DIR}/.tf-plugin-cache,${CI_PROJECT_DIR}/.terraform"
+      --report-formats json,glsast -o "${CI_PROJECT_DIR}/kics"
+      --fail-on high,medium
+  artifacts:
+    when: always
+    paths:
+      - kics/
+    reports:
+      sast: kics/gl-sast-results.json
+
+# -------------------------------------------------------------------- plan ---
+
+plan:
+  extends: .terraform
+  stage: plan
+  tags: [openstack]          # runner qui joint l'API OpenStack
+  resource_group: ${TF_STATE_NAME}
+  script:
+    - *backend-gitlab
+    - terraform init -lockfile=readonly
+    - terraform plan -out=plan.cache
+    - terraform show -json plan.cache > plan.json
+    # Résumé affiché dans la merge request (widget Terraform de GitLab)
+    - apk add --no-cache jq >/dev/null
+    - >
+      jq '([.resource_changes[]?.change.actions?] | flatten)
+      | {create: (map(select(. == "create")) | length),
+         update: (map(select(. == "update")) | length),
+         delete: (map(select(. == "delete")) | length)}' plan.json > plan-report.json
+  artifacts:
+    paths:
+      - plan.cache
+      - plan.json
+    reports:
+      terraform: plan-report.json
+    expire_in: 1 week
+
+# Le plan contient les valeurs RÉSOLUES (y compris dans les modules) :
+# c'est ici que Checkov voit, par exemple, un SSH ouvert à 0.0.0.0/0.
+checkov-plan:
+  stage: plan
+  needs: [plan]
+  image:
+    name: ${CHECKOV_IMAGE}
+    entrypoint: [""]
+  script:
+    - checkov -f plan.json --framework terraform_plan --compact -o cli -o junitxml --output-file-path console,checkov-plan.xml
+  artifacts:
+    when: always
+    reports:
+      junit: checkov-plan.xml
+
+# ------------------------------------------------------------- deploiement ---
+
+apply:
+  extends: .terraform
+  stage: deploiement
+  tags: [openstack]
+  needs: [plan, checkov-plan]
+  resource_group: ${TF_STATE_NAME}
+  environment:
+    name: ${TF_STATE_NAME}
+    on_stop: destroy
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  script:
+    - *backend-gitlab
+    - terraform init -lockfile=readonly
+    # Applique EXACTEMENT le plan relu, pas un nouveau calcul
+    - terraform apply plan.cache
+
+destroy:
+  extends: .terraform
+  stage: deploiement
+  tags: [openstack]
+  needs: []
+  resource_group: ${TF_STATE_NAME}
+  environment:
+    name: ${TF_STATE_NAME}
+    action: stop
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+  script:
+    - *backend-gitlab
+    - terraform init -lockfile=readonly
+    - terraform destroy -auto-approve

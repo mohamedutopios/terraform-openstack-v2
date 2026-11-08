@@ -1,0 +1,6 @@
+# L'état du socle contient les mots de passe générés : jamais dans git
+*.tfstate
+*.tfstate.*
+.terraform/
+clouds.yaml
+clouds-*.yaml

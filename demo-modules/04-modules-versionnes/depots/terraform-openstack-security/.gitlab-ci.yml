@@ -1,0 +1,12 @@
+# Le pipeline n'est PAS écrit ici : il vient du dépôt partagé
+# terraform-ci-templates, lui aussi versionné par tag.
+# Monter de version de pipeline = changer "ref", comme pour un module.
+include:
+  - project: mohamed.aijjou1780/terraform-ci-templates
+    ref: v1.1.0
+    file: templates/module.yml
+
+variables:
+  # Nom et "système" du module dans le registre Terraform de GitLab
+  MODULE_NAME: security
+  MODULE_SYSTEM: openstack

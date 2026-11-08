@@ -1,0 +1,14 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "enabledManagers": ["terraform"],
+  "packageRules": [
+    {
+      "description": "Nouveau tag MAJEUR d'un module : MR étiquetée, jamais fusionnée automatiquement",
+      "matchManagers": ["terraform"],
+      "matchUpdateTypes": ["major"],
+      "labels": ["breaking-change"],
+      "automerge": false
+    }
+  ]
+}

@@ -1,0 +1,225 @@
+# =============================================================================
+# Pipeline d'un dépôt MULTI-ENVIRONNEMENTS — partie COMMUNE (incluse 1 fois)
+#
+#   envs/dev/       un root, un backend (backend.hcl), un état GitLab
+#   envs/staging/   idem
+#   envs/prod/      idem
+#
+# À compléter par templates/environnement.yml, inclus UNE FOIS PAR
+# ENVIRONNEMENT avec  inputs: { env: <nom>, tier: <deployment_tier> }.
+#
+#   conformite : refs de modules épinglées, backends cohérents (un état
+#                distinct par env, qui porte son nom), matrice des versions,
+#                aucun secret commité
+#   qualite    : fmt sur tout le dépôt
+#   securite   : checkov (code + modules téléchargés), KICS
+#
+# Prérequis GitLab, par environnement (Settings > CI/CD > Variables,
+# "Environment scope" = dev / staging / prod) :
+#   OS_CLIENT_CONFIG_FILE (type fichier) = clouds.yaml de CET environnement
+#   -> protégée pour prod : seule la branche par défaut la reçoit
+# Et pour tous :  TF_VAR_public_key_path (type fichier) = clé publique SSH
+# =============================================================================
+
+variables:
+  TF_VERSION: "1.16.7"
+  TFLINT_IMAGE: ghcr.io/terraform-linters/tflint:v0.64.0
+  CHECKOV_IMAGE: bridgecrew/checkov:3.4.2
+  KICS_IMAGE: checkmarx/kics:v2.1.21
+  GITLEAKS_IMAGE: zricethezav/gitleaks:v8.29.1
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+  TF_PLUGIN_CACHE_DIR: ${CI_PROJECT_DIR}/.tf-plugin-cache
+  # Identifiants du backend http (l'adresse est dans envs/<env>/backend.hcl)
+  TF_HTTP_USERNAME: gitlab-ci-token
+  TF_HTTP_PASSWORD: ${CI_JOB_TOKEN}
+
+stages:
+  - conformite
+  - qualite
+  - securite
+  - plan
+  - deploiement
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_PIPELINE_SOURCE == "schedule"     # détection de dérive
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+# Base des jobs Terraform, réutilisée (extends) par environnement.yml
+.tf-env:
+  image:
+    name: hashicorp/terraform:${TF_VERSION}
+    entrypoint: [""]
+  before_script:
+    # Modules dans des dépôts privés : git injecte le jeton du job
+    - git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/".insteadOf "https://${CI_SERVER_HOST}/"
+    - mkdir -p "${TF_PLUGIN_CACHE_DIR}"
+  cache:
+    key: tf-providers-${TF_VERSION}
+    paths:
+      - .tf-plugin-cache/
+
+.hors-planification:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+
+# -------------------------------------------------------------- conformite ---
+
+verifier-refs-modules:
+  extends: .hors-planification
+  stage: conformite
+  image: alpine:3.22
+  script:
+    - |
+      find . -name '*.tf' -not -path '*/.terraform/*' -exec awk '
+        /^[[:space:]]*module[[:space:]]+"/ { dans_module = 1 }
+        dans_module && /^[[:space:]]*source[[:space:]]*=/ {
+          match($0, /"[^"]+"/); print FILENAME "|" substr($0, RSTART + 1, RLENGTH - 2)
+          dans_module = 0
+        }' {} + > sources.txt
+      ko=0
+      while IFS='|' read -r f src; do
+        case "$src" in
+          ./*|../*) echo "KO  $f : module local non versionné : $src"; ko=1 ;;
+          git::*)
+            if echo "$src" | grep -Eq '[?&]ref=v[0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "OK  $f : $src"
+            else
+              echo "KO  $f : module git non épinglé sur un tag SemVer : $src"; ko=1
+            fi ;;
+          *) echo "OK? $f : module de registre, vérifier son argument version : $src" ;;
+        esac
+      done < sources.txt
+      [ "$ko" = 0 ] || { echo "=> références de modules non conformes"; exit 1; }
+
+# Le risque n°1 du dossier par environnement : copier envs/prod vers
+# envs/staging et oublier backend.hcl -> staging écrirait dans l'état de prod.
+verifier-backends:
+  extends: .hors-planification
+  stage: conformite
+  image: alpine:3.22
+  script:
+    - |
+      ko=0
+      for d in envs/*/; do
+        env=$(basename "$d")
+        grep -q 'backend "http"' "$d/backend.tf" 2>/dev/null \
+          || { echo "KO  $env : backend.tf sans backend \"http\""; ko=1; }
+        adr=$(sed -nE 's/^[[:space:]]*address[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' "$d/backend.hcl" 2>/dev/null)
+        etat=${adr##*/terraform/state/}
+        case "$etat" in
+          *-"$env") echo "OK  $env : état $etat" ;;
+          *) echo "KO  $env : l'état '$etat' ne porte pas le nom de l'environnement"; ko=1 ;;
+        esac
+        for cle in lock_address unlock_address; do
+          v=$(sed -nE "s/^[[:space:]]*${cle}[[:space:]]*=[[:space:]]*\"([^\"]+)\".*/\1/p" "$d/backend.hcl")
+          [ "$v" = "$adr/lock" ] || { echo "KO  $env : $cle ne correspond pas à address"; ko=1; }
+        done
+        grep -Eq "^[[:space:]]*environnement[[:space:]]*=[[:space:]]*\"$env\"" "$d/terraform.tfvars" \
+          || { echo "KO  $env : terraform.tfvars ne déclare pas environnement = \"$env\""; ko=1; }
+        echo "$adr" >> adresses.txt
+      done
+      # Un backend_override.tf (backend local de poste) ne doit jamais être commité
+      for f in envs/*/*override.tf; do
+        [ -e "$f" ] && { echo "KO  $f : fichier d'override commité (backend de poste de travail)"; ko=1; }
+      done
+      doublons=$(sort adresses.txt | uniq -d)
+      [ -z "$doublons" ] || { echo "KO  état partagé par plusieurs environnements : $doublons"; ko=1; }
+      [ "$ko" = 0 ] || { echo "=> backends non conformes"; exit 1; }
+
+# Qui tourne en quelle version ? Visible à chaque pipeline (artefact).
+matrice-versions:
+  extends: .hors-planification
+  stage: conformite
+  image: alpine:3.22
+  script:
+    - |
+      for f in envs/*/main.tf; do
+        env=$(basename "$(dirname "$f")")
+        sed -nE 's|.*source[[:space:]]*=[[:space:]]*"git::.*/([^/]+)\.git\?ref=([^"]+)".*|\1 \2|p' "$f" \
+          | while read -r mod ref; do echo "$mod $env $ref"; done
+      done > versions.txt
+      # ordre de promotion d'abord, puis les autres dossiers éventuels
+      envs=$(for e in dev staging prod; do [ -d "envs/$e" ] && echo "$e"; done; ls envs | grep -vxE 'dev|staging|prod' || true)
+      {
+        printf '| module |'; for e in $envs; do printf ' %s |' "$e"; done; echo ' état |'
+        printf '|---|'; for e in $envs; do printf '---|'; done; echo '---|'
+        for mod in $(cut -d' ' -f1 versions.txt | sort -u); do
+          refs=""; printf '| %s |' "$mod"
+          for e in $envs; do
+            r=$(awk -v m="$mod" -v e="$e" '$1==m && $2==e {print $3}' versions.txt)
+            printf ' %s |' "${r:--}"; refs="$refs $r"
+          done
+          n=$(echo $refs | tr ' ' '\n' | sort -u | wc -l)
+          if [ "$n" -gt 1 ]; then echo ' promotion en cours |'; else echo ' aligné |'; fi
+        done
+      } > matrice-versions.md
+      cat matrice-versions.md
+  artifacts:
+    paths:
+      - matrice-versions.md
+
+gitleaks:
+  extends: .hors-planification
+  stage: conformite
+  image:
+    name: ${GITLEAKS_IMAGE}
+    entrypoint: [""]
+  script:
+    - gitleaks dir . --redact --verbose --report-format junit --report-path gitleaks.xml
+  artifacts:
+    when: always
+    reports:
+      junit: gitleaks.xml
+
+# ----------------------------------------------------------------- qualite ---
+
+fmt:
+  extends: [.tf-env, .hors-planification]
+  stage: qualite
+  needs: []
+  script:
+    - terraform fmt -check -recursive -diff
+
+# ---------------------------------------------------------------- securite ---
+
+checkov:
+  extends: .hors-planification
+  stage: securite
+  needs: []
+  image:
+    name: ${CHECKOV_IMAGE}
+    entrypoint: [""]
+  before_script:
+    - git config --global url."https://gitlab-ci-token:${CI_JOB_TOKEN}@${CI_SERVER_HOST}/".insteadOf "https://${CI_SERVER_HOST}/"
+  script:
+    - checkov -d . --config-file .checkov.yaml -o cli -o junitxml --output-file-path console,checkov.xml
+  artifacts:
+    when: always
+    reports:
+      junit: checkov.xml
+
+kics:
+  extends: .hors-planification
+  stage: securite
+  needs: []
+  image:
+    name: ${KICS_IMAGE}
+    entrypoint: [""]
+  script:
+    - /app/bin/kics scan -p "${CI_PROJECT_DIR}" --ci --no-progress
+      --exclude-paths "${CI_PROJECT_DIR}/.tf-plugin-cache"
+      --report-formats json,glsast -o "${CI_PROJECT_DIR}/kics"
+      --fail-on high,medium
+  artifacts:
+    when: always
+    paths:
+      - kics/
+    reports:
+      sast: kics/gl-sast-results.json

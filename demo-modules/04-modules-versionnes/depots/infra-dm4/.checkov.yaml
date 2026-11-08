@@ -1,0 +1,11 @@
+framework:
+  - terraform
+compact: true
+quiet: true
+# Checkov récupère les modules git pour analyser aussi LEUR code
+download-external-modules: true
+skip-check:
+  # CKV_TF_1 exige un hash de commit dans ?ref=. Choix d'équipe : tag SemVer
+  # lisible (contrôlé par CKV_TF_2 et le job verifier-refs-modules), rendu
+  # immuable par la protection des tags v* dans chaque dépôt de module.
+  - CKV_TF_1

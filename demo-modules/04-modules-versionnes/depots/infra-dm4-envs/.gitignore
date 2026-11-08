@@ -1,0 +1,13 @@
+.terraform/
+.tf-plugin-cache/
+*.tfstate
+*.tfstate.*
+plan.cache
+plan.json
+plan-report.json
+crash.log
+# Identifiants : jamais dans git
+clouds.yaml
+clouds-*.yaml
+# Backend local de poste de travail (voir README)
+backend_override.tf

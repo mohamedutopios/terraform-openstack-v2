@@ -1,0 +1,5 @@
+# Checkov : analyse statique de sécurité (dont les règles CKV_OPENSTACK_*)
+framework:
+  - terraform
+compact: true
+quiet: true

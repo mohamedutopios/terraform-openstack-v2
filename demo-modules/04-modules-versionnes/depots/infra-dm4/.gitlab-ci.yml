@@ -1,0 +1,8 @@
+include:
+  - project: mohamed.aijjou1780/terraform-ci-templates
+    ref: v1.1.0
+    file: templates/infra.yml
+
+variables:
+  # Nom de l'état dans Operate > Terraform states
+  TF_STATE_NAME: dm4

@@ -1,0 +1,15 @@
+# terraform-docs : génère la section entre les balises BEGIN/END_TF_DOCS
+# du README. Le job "docs" échoue si le README n'est pas à jour.
+formatter: markdown table
+
+output:
+  file: README.md
+  mode: inject
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  anchor: false
+  lockfile: false

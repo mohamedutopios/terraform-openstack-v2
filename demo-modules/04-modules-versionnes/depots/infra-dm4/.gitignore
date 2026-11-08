@@ -1,0 +1,11 @@
+.terraform/
+.tf-plugin-cache/
+*.tfstate
+*.tfstate.*
+plan.cache
+plan.json
+plan-report.json
+backend_ci.tf
+crash.log
+# Identifiants OpenStack : jamais dans git
+clouds.yaml

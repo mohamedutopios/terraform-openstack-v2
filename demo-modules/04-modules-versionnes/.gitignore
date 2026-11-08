@@ -1,0 +1,5 @@
+# Générés par les scripts de la démo
+.depots-git/
+.cache/
+.terraform/
+travail/

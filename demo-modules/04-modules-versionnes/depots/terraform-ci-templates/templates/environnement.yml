@@ -1,0 +1,189 @@
+spec:
+  inputs:
+    env:
+      description: "Nom de l'environnement : dossier envs/<env>, environnement GitLab <env>"
+    tier:
+      description: "deployment_tier de l'environnement GitLab"
+      options: [development, testing, staging, production, other]
+      default: development
+    plan_en_mr:
+      description: "Planifier aussi dans les MR. false pour un environnement dont les identifiants sont protégés (prod) : une MR ne les reçoit pas"
+      type: boolean
+      default: true
+---
+# =============================================================================
+# Pipeline d'UN environnement — inclus une fois par environnement :
+#
+#   include:
+#     - project: mohamed.aijjou1780/terraform-ci-templates
+#       ref: v1.2.0
+#       file: templates/environnement.yml
+#       inputs: { env: prod, tier: production }
+#
+# Jobs créés (suffixés par l'environnement) :
+#   validate-<env>, tflint-<env>          si envs/<env>/ a changé
+#   plan-<env>, checkov-plan-<env>        idem, runner "openstack"
+#                                         (pas en MR si plan_en_mr = false)
+#   apply-<env>, destroy-<env>            manuels, branche par défaut
+#   derive-<env>                          pipeline planifié uniquement
+#
+# Seul l'environnement MODIFIÉ est planifié : une MR qui promeut une version
+# en dev ne touche ni à staging ni à prod.
+# Nécessite templates/environnements.yml (stages, .tf-env).
+# =============================================================================
+
+.env-$[[ inputs.env ]]:
+  extends: .tf-env
+  variables:
+    TF_ROOT: envs/$[[ inputs.env ]]
+    PLAN_EN_MR: "$[[ inputs.plan_en_mr ]]"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - changes:
+        - envs/$[[ inputs.env ]]/**/*
+        - .gitlab-ci.yml
+
+# Plan : comme ci-dessus, sauf en MR si plan_en_mr = false
+.plan-$[[ inputs.env ]]:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $PLAN_EN_MR == "false"
+      when: never
+    - changes:
+        - envs/$[[ inputs.env ]]/**/*
+        - .gitlab-ci.yml
+
+validate-$[[ inputs.env ]]:
+  extends: .env-$[[ inputs.env ]]
+  stage: qualite
+  needs: []
+  script:
+    - terraform -chdir="${TF_ROOT}" init -backend=false -lockfile=readonly
+    - terraform -chdir="${TF_ROOT}" validate
+  artifacts:
+    paths:
+      - envs/$[[ inputs.env ]]/.terraform/modules/
+    expire_in: 1 hour
+
+tflint-$[[ inputs.env ]]:
+  extends: .env-$[[ inputs.env ]]
+  stage: qualite
+  needs: [validate-$[[ inputs.env ]]]
+  image:
+    name: ${TFLINT_IMAGE}
+    entrypoint: [""]
+  before_script: []
+  script:
+    - tflint --chdir="${TF_ROOT}" --config "${CI_PROJECT_DIR}/.tflint.hcl" --call-module-type=all -f compact
+
+# environment + action: prepare : le job reçoit les variables limitées à
+# cet environnement (OS_CLIENT_CONFIG_FILE) sans compter comme déploiement.
+plan-$[[ inputs.env ]]:
+  extends: [.env-$[[ inputs.env ]], .plan-$[[ inputs.env ]]]
+  stage: plan
+  tags: [openstack]
+  resource_group: $[[ inputs.env ]]
+  environment:
+    name: $[[ inputs.env ]]
+    action: prepare
+  script:
+    - terraform -chdir="${TF_ROOT}" init -backend-config=backend.hcl -lockfile=readonly
+    - terraform -chdir="${TF_ROOT}" plan -out=plan.cache
+    - terraform -chdir="${TF_ROOT}" show -json plan.cache > "${TF_ROOT}/plan.json"
+    - apk add --no-cache jq >/dev/null
+    - >
+      jq '([.resource_changes[]?.change.actions?] | flatten)
+      | {create: (map(select(. == "create")) | length),
+         update: (map(select(. == "update")) | length),
+         delete: (map(select(. == "delete")) | length)}' "${TF_ROOT}/plan.json" > "${TF_ROOT}/plan-report.json"
+  artifacts:
+    name: plan-$[[ inputs.env ]]
+    paths:
+      - envs/$[[ inputs.env ]]/plan.cache
+      - envs/$[[ inputs.env ]]/plan.json
+    reports:
+      terraform: envs/$[[ inputs.env ]]/plan-report.json
+    expire_in: 1 week
+
+checkov-plan-$[[ inputs.env ]]:
+  extends: [.env-$[[ inputs.env ]], .plan-$[[ inputs.env ]]]
+  stage: plan
+  needs: [plan-$[[ inputs.env ]]]
+  image:
+    name: ${CHECKOV_IMAGE}
+    entrypoint: [""]
+  before_script: []
+  script:
+    - checkov -f "${TF_ROOT}/plan.json" --framework terraform_plan --compact
+
+apply-$[[ inputs.env ]]:
+  extends: .env-$[[ inputs.env ]]
+  stage: deploiement
+  tags: [openstack]
+  needs: [plan-$[[ inputs.env ]], checkov-plan-$[[ inputs.env ]]]
+  resource_group: $[[ inputs.env ]]
+  environment:
+    name: $[[ inputs.env ]]
+    deployment_tier: $[[ inputs.tier ]]
+    on_stop: destroy-$[[ inputs.env ]]
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - envs/$[[ inputs.env ]]/**/*
+        - .gitlab-ci.yml
+      when: manual
+  script:
+    - terraform -chdir="${TF_ROOT}" init -backend-config=backend.hcl -lockfile=readonly
+    # Applique EXACTEMENT le plan relu
+    - terraform -chdir="${TF_ROOT}" apply plan.cache
+
+destroy-$[[ inputs.env ]]:
+  extends: .env-$[[ inputs.env ]]
+  stage: deploiement
+  tags: [openstack]
+  needs: []
+  resource_group: $[[ inputs.env ]]
+  environment:
+    name: $[[ inputs.env ]]
+    action: stop
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+      allow_failure: true
+  script:
+    - terraform -chdir="${TF_ROOT}" init -backend-config=backend.hcl -lockfile=readonly
+    - terraform -chdir="${TF_ROOT}" destroy -auto-approve
+
+# Pipeline planifié (CI/CD > Schedules) : le réel correspond-il au code ?
+# -detailed-exitcode : 0 = rien à faire, 2 = dérive (modif manuelle dans
+# Horizon, ressource supprimée à la main...), 1 = erreur.
+derive-$[[ inputs.env ]]:
+  extends: .tf-env
+  stage: plan
+  tags: [openstack]
+  needs: []
+  variables:
+    TF_ROOT: envs/$[[ inputs.env ]]
+  environment:
+    name: $[[ inputs.env ]]
+    action: verify
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    - terraform -chdir="${TF_ROOT}" init -backend-config=backend.hcl -lockfile=readonly
+    - |
+      set +e
+      terraform -chdir="${TF_ROOT}" plan -detailed-exitcode -lock=false
+      code=$?
+      set -e
+      case $code in
+        0) echo "$[[ inputs.env ]] : aucune dérive" ;;
+        2) echo "$[[ inputs.env ]] : DÉRIVE entre le code et l'infrastructure réelle"; exit 1 ;;
+        *) exit $code ;;
+      esac
